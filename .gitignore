@@ -1,0 +1,23 @@
+# Sécurité (NE JAMAIS POUSSER CES FICHIERS)
+.env
+*.env
+.env.*
+ngrok.exe
+
+# Environnements virtuels
+.venv/
+venv/
+env/
+
+# Fichiers générés par Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Outils de développement
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
