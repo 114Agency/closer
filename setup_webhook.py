@@ -1,14 +1,10 @@
 import requests
+from config import settings # Import de l'objet Dynaconf
 
-# 1. Remplace par ta vraie clé 360dialog Sandbox
-api_key = "170S58NXD1HDE0XHYIWG6GSGWJG3RQV5" 
-
-# 2. Remplace par ton adresse ngrok exacte (sans oublier /whatsapp/incoming à la fin !)
-# ngrok_url = "https://outfield-pronounce-handheld.ngrok-free.dev/whatsapp/incoming" 
-# 👇 Fini ngrok, on met l'adresse directe du VPS 👇
-ngrok_url = "http://vpshosted.ddnsfree.com:8002/whatsapp/incoming"
-
-url = "https://waba-sandbox.360dialog.io/v1/configs/webhook"
+# Dynaconf te renvoie directement la valeur secrète lue dans le .env !
+api_key = settings.api_keys.d360
+url_api = settings.urls.d360_webhook_setup
+webhook_url = settings.webhook.closer_url
 
 headers = {
     "D360-API-KEY": api_key,
@@ -16,11 +12,9 @@ headers = {
 }
 
 payload = {
-    "url": ngrok_url
+    "url": webhook_url
 }
 
-print("Configuration du Webhook en cours...")
-response = requests.post(url, headers=headers, json=payload)
-
+print(f"📡 Configuration du Webhook en cours...")
+response = requests.post(url_api, headers=headers, json=payload)
 print(f"Code HTTP : {response.status_code}")
-print(f"Réponse API : {response.text}")

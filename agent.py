@@ -1,218 +1,332 @@
 import os
 import json
-import re
 from typing import Dict, Any
 from dotenv import load_dotenv
 
-# Connecteur pour l'architecture LLM compatible OpenAI
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
-from langfuse import Langfuse
-from langfuse.langchain import CallbackHandler
+from config import settings
+import litellm
+import instructor
+from pydantic import BaseModel, Field
+import guardrails as gd
+from langfuse import Langfuse, observe, propagate_attributes
 
 from tools.whatsapp_tool import send_whatsapp_message
 from tools.crm_tool import update_crm_after_message
+from tools.cal_tool import get_available_slots
 
-# Chargement des variables d'environnement (.env)
 load_dotenv()
+
+# Initialisation du client Langfuse central
+langfuse_client = Langfuse()
+
+# Modèles Pydantic pour Instructor
+class SentimentAnalysis(BaseModel):
+    score: float = Field(..., description="Score de sentiment de 0.0 (très négatif/frustré) à 1.0 (très positif).")
+    is_escalation_needed: bool = Field(..., description="True si le prospect est frustré, en colère ou négatif.")
+    intention: str = Field(..., description="L'intention du prospect (ex: DEMANDE_RDV, QUESTION_TECHNIQUE, DEMANDE_PRIX, REFUS, INFO).")
+
+class ObjectionAnalysis(BaseModel):
+    intention: str = Field(..., description="L'intention exacte : PRENDRE_RDV, INTERESSE, OBJECTION_PRIX, OBJECTION_TEMPS, REFUS")
+    reponse_generee: str = Field(..., description="Réponse courte de 1 à 2 phrases maximum.")
 
 class CloserAgent:
     def __init__(self):
-        """
-        Initialise l'Agent Closer avec sa logique de séquences de relance
-        et son moteur cognitif NLP (Gemma).
-        """
-        print("🧠 [CLOSER] Initialisation de l'Agent Closer...")
-
-        # 1. Définition des séquences de messages
-        self.sequences = {
-            "mql": {
-                1: "Bonjour {name}, j'ai bien reçu votre demande concernant notre solution. Seriez-vous disponible pour un court échange cette semaine ?",
-                2: "Bonjour {name}, je me permets de vous relancer suite à mon message d'hier. Avez-vous pu y jeter un œil ?",
-                3: "Hello {name}, sans retour de votre part, je suppose que le moment est mal choisi. Je classe votre dossier pour l'instant."
-            },
-            "sql": {
-                1: "Bonjour {name}, suite à votre demande, je vous propose d'en discuter de vive voix. Quel serait le meilleur moment ?",
-                2: "Bonjour {name}, les places pour nos sessions se remplissent vite. Souhaitez-vous bloquer un créneau ?"
-            }
-        }
-
-        # 2. Configuration du Cerveau LLM distant
-        print(f"🤖 [CLOSER] Connexion au modèle {os.getenv('LLM_MODEL_NAME', 'Gemma')}...")
-        self.llm = ChatOpenAI(
-            base_url=os.getenv("LLM_BASE_URL"),
-            api_key=os.getenv("LLM_API_KEY"),
-            model=os.getenv("LLM_MODEL_NAME"),
-            temperature=0.3,
-            max_tokens=250
-        )
+        print("🧠 [CLOSER] Initialisation de l'Agent Closer (Phase C)...")
         
-        self.parser = JsonOutputParser()
-        # 3. Prompt de qualification des réponses clients
-        self.objection_prompt = PromptTemplate(
-            input_variables=["name", "industry", "message"],
-            partial_variables={"format_instructions": self.parser.get_format_instructions()},
-            template="""Tu es un Agent Closer expert en automatisation B2B.
-            Ton prospect {name} (travaillant dans le secteur : {industry}) a répondu à ton message :
-            "{message}"
+        # 🎯 NOUVEAU : Mapping strict des modèles Dev OpenRouter
+        self.model_workhorse = settings.models.workhorse     # DeepSeek V4 Flash
+        self.model_quality = settings.models.quality         # DeepSeek V4 Pro
+        
+        self.client = instructor.from_litellm(litellm.acompletion)
 
-            Tâche 1 : Analyse l'intention exacte du prospect. Choisis STRICTEMENT parmi ces étiquettes :
-            - "PRENDRE_RDV" (Le prospect est très chaud, valide l'offre ou demande à s'appeler)
-            - "INTERESSE" (Le prospect veut juste plus d'informations ou pose une question)
-            - "OBJECTION_PRIX" 
-            - "OBJECTION_TEMPS"
-            - "REFUS"
+        # 🛡️ Initialisation d'un Guardrail basique (sans le Hub externe pour l'instant)
+        self.reply_guard = gd.Guard()
 
-            Tâche 2 : Rédige une réponse courte (1 à 2 phrases maximum), professionnelle, humaine et persuasive pour traiter cette situation. 
+    @observe(name="[Closer : Sortant] Handle Out-of-Template Reply")
+    async def handle_out_of_template_reply(self, lead_data: Dict[str, Any], message_text: str) -> Dict[str, Any]:
+        """
+        Gère les réponses libres avec analyse de sentiment (Flash) et génération (Pro).
+        """
+        lead_id = lead_data.get("lead_id", "unknown")
+        name = lead_data.get("first_name", "Client")
+        numero_client = lead_data.get("phone", "+212600000000")
+
+        # Création de la session Langfuse pour l'audit complet
+        with propagate_attributes(
+            user_id=lead_id,
+            session_id=lead_id,
+            tags=[lead_id, "phase_c", "out_of_template"]
+        ):
+            # ==========================================
+            # ÉTAPE 1 : DÉTECTION DE SENTIMENT (DeepSeek V4 Flash)
+            # ==========================================
+            # messages_pour_sentiment = [
+            #     {"role": "system", "content": "Analyse le sentiment de ce message client. Si c'est de la frustration, de la colère ou une plainte, is_escalation_needed doit être True."},
+            #     {"role": "user", "content": message_text}
+              # ]
+
+            # 1. Télécharger le prompt dynamique depuis Langfuse
+            prompt_sentiment = langfuse_client.get_prompt("closer_sentiment_analysis")
+            system_instruction_sentiment = prompt_sentiment.compile()
+            messages_pour_sentiment = [
+                {"role": "system", "content": system_instruction_sentiment},
+                {"role": "user", "content": message_text}
+            ]
+
+            with langfuse_client.start_as_current_observation(
+                as_type="generation",
+                name="sentiment-detection",
+                model=self.model_workhorse, 
+                prompt=prompt_sentiment,
+                input=messages_pour_sentiment
+            ) as sentiment_trace:
+                
+                sentiment_result = await self.client.messages.create_with_completion(
+                    model=self.model_workhorse,
+                    messages=messages_pour_sentiment,
+                    response_model=SentimentAnalysis,
+                )
+                
+                sentiment_data = sentiment_result[0]
+                raw_response = sentiment_result[1]
+                # 🎯 CORRECTION : Création de la variable usage_data manquante
+                usage_data = getattr(raw_response, 'usage', None)
+                usage_details = {}
+                if usage_data:
+                    # Gestion de la structure (dict ou objet) selon la version d'Instructor/LiteLLM
+                    if isinstance(usage_data, dict):
+                        usage_details = {
+                            "input": usage_data.get("prompt_tokens", 0),
+                            "output": usage_data.get("completion_tokens", 0),
+                            "total": usage_data.get("total_tokens", 0)
+                        }
+                    else:
+                        usage_details = {
+                            "input": getattr(usage_data, "prompt_tokens", 0),
+                            "output": getattr(usage_data, "completion_tokens", 0),
+                            "total": getattr(usage_data, "total_tokens", 0)
+                        }
+                sentiment_trace.update(
+                    output=sentiment_data.model_dump(),
+                    usage_details=usage_details,
+                    tags=["sentiment_score"]
+                )
+
+            # Règle Métier : Escalade immédiate si négatif
+            if sentiment_data.is_escalation_needed:
+                print(f"🚨 [ESCALADE] Sentiment négatif détecté (Score: {sentiment_data.score}). Arrêt de l'IA.")
+                return {"status": "escalated", "reason": "negative_sentiment", "score": sentiment_data.score}
+
+           
+            # ==========================================
+            # ÉTAPE 2 : GÉNÉRATION DE LA RÉPONSE (DeepSeek V4 Pro)
+            # ==========================================
+            print("💬 [NLP] Sentiment positif/neutre. Génération de la réponse sur-mesure...")
             
-            🚨 DIRECTIVES ABSOLUES :
-            - Si l'intention est "PRENDRE_RDV", tu DOIS obligatoirement amener la prise d'appel et inclure ce lien exact dans ta réponse : https://cal.com/hamza-bouazza-g3drhd/
-            - Si c'est un "REFUS", reste extrêmement poli, remercie-le et clos proprement la discussion.
-            - N'invente JAMAIS de faux liens.
+            # 1. Récupération des créneaux
+            disponibilites_cal = await get_available_slots(3)
 
-            {format_instructions}
-            Assure-toi que les clés du JSON de sortie soient exactement "intention" et "reponse_generee". Ne génère aucun autre texte.
-            """
-        )
-        print("👁️ [OBSERVABILITÉ] Démarrage du traceur Langfuse...")
-        self.langfuse_client = Langfuse()
-        self.langfuse_handler = CallbackHandler()
+            prompt_template = langfuse_client.get_prompt("closer_free_form_guidelines")
+            
+            # 2. Injection des disponibilités
+            system_prompt = prompt_template.compile(
+                name=name,
+                disponibilites=disponibilites_cal
+            )
+            messages_pour_llm = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message_text}
+            ]
 
+            with langfuse_client.start_as_current_observation(
+                as_type="generation",
+                name="free-form-reply-generation",
+                model=self.model_quality, 
+                prompt=prompt_template,
+                input=messages_pour_llm  # <-- Ajout ici
+            ) as generation_trace:
+                
+                response = await litellm.acompletion(
+                    model=self.model_quality,
+                    messages=messages_pour_llm
+                )
+                
+                raw_generated_text = response.choices[0].message.content
+                # 🎯 CORRECTION 2 : Extraction et formatage des tokens
+                usage_data = getattr(response, 'usage', None)
+                usage_details = {}
+                if usage_data:
+                    usage_details = {
+                        "input": getattr(usage_data, "prompt_tokens", 0),
+                        "output": getattr(usage_data, "completion_tokens", 0),
+                        "total": getattr(usage_data, "total_tokens", 0)
+                    }
+
+               
+               # ==========================================
+                # ÉTAPE 3 : SÉCURISATION VIA GUARDRAILS AI
+                # ==========================================
+                try:
+                    # Guardrails renvoie un objet ValidationOutcome
+                    outcome = self.reply_guard.parse(raw_generated_text)
+                    
+                    # 🎯 CORRECTION : On extrait le vrai texte de l'objet
+                    validated_text = outcome.validated_output
+                    
+                    generation_trace.update(
+                        output={"generated_reply": validated_text, "guardrail_passed": True},
+                        usage_details=usage_details, # <-- Ajout ici
+                        metadata={"sentiment_score": sentiment_data.score}
+                    )
+                    
+                    return {
+                        "status": "success", 
+                        "reply": validated_text, 
+                        "intention": sentiment_data.intention  # <-- Ajout ici
+                    }
+
+                except Exception as e:
+                    print(f"❌ [GUARDRAIL] La réponse générée a été bloquée : {e}")
+                    generation_trace.update(level="WARNING", status_message="Blocked by Guardrails AI")
+                    return {"status": "escalated", "reason": "guardrail_failure"}
+    
+    @observe(name="[Closer : Sortant] Process and Send Message")
     async def process_and_send_message(self, lead_data: Dict[str, Any], current_step: int, classification: str) -> Dict[str, Any]:
         """
-        Logique Sortante : Sélectionne le message, l'envoie via WhatsApp et met à jour le CRM.
+        Logique Sortante : Télécharge le template depuis Langfuse, l'envoie via WhatsApp et met à jour le CRM.
         """
         lead_id = lead_data.get("lead_id", "unknown")
         name = lead_data.get("first_name", "Client")
         numero_client = lead_data.get("phone", "+212600000000")
         
         template_id = f"{classification.lower()}_step_{current_step}"
-        channel = "whatsapp"
         
         print(f"\n[CLOSER] Traitement du lead {name} | Statut: {classification.upper()} | Étape: {current_step}")
 
-        # 🟢 CRÉATION DE LA TRACE LANGFUSE
-        trace = self.langfuse_client.trace(
-            name="outbound_sequence_message",
-            user_id=lead_id,
-            session_id=lead_id,
-            # 🎯 Les tags exacts demandés dans le cahier des charges :
-            tags=[lead_id, template_id, channel, classification]
-        )
+        with propagate_attributes(
+            tags=[lead_id, template_id, "whatsapp", classification, self.model_workhorse, f"step_{current_step}"],
+            session_id=lead_id
+        ):
+            try:
+                prompt_template = langfuse_client.get_prompt(template_id)
+                message_text = prompt_template.compile(name=name)
+            except Exception as e:
+                print(f"❌ [CLOSER] Template WhatsApp '{template_id}' introuvable dans Langfuse : {e}")
+                return {"status": "error", "reason": "template_not_found"}
 
-        # 1. Récupération du template
-        sequence_steps = self.sequences.get(classification.lower())
-        if not sequence_steps or current_step not in sequence_steps:
-            print(f"❌ [CLOSER] Pas de message trouvé...")
-            trace.update(level="ERROR", status_message="Template not found") # On trace l'erreur
-            return {"status": "error", "reason": "sequence_step_not_found"}
-
-        # 2. Personnalisation du texte
-        message_text = sequence_steps[current_step].format(name=name)
+            payload_interne = {
+                "lead_id": lead_id,
+                "classification": classification,
+                "step": current_step,
+                "message_content": message_text
+            }
+            
+            resultat_envoi = await send_whatsapp_message(numero_client, message_text)
+            payload_interne["delivery_status"] = resultat_envoi
+            
+            if resultat_envoi.get("status") in ["success", "mocked"]:
+                crm_result = await update_crm_after_message(
+                    lead_id=lead_id,
+                    step_sent=current_step,
+                    classification=classification
+                )
+                payload_interne["crm_update_status"] = crm_result
+            else:
+                print("⚠️ [CLOSER] Échec de l'envoi WhatsApp. Mise à jour du CRM annulée.")
+                payload_interne["crm_update_status"] = {"status": "skipped", "reason": "WhatsApp failure"}
+            
+            return payload_interne
         
-        # 🟢 ON ENREGISTRE L'ÉVÉNEMENT DU TEMPLATE
-        trace.event(
-            name="template_selected", 
-            input={"step": current_step, "classification": classification}, 
-            output={"final_message": message_text}
-        )
-
-        payload_interne = {
-            "lead_id": lead_id,
-            "classification": classification,
-            "step": current_step,
-            "message_content": message_text
-        }
-        
-        # ... (la suite de ta fonction avec send_whatsapp_message et update_crm_after_message reste identique) ...
-
-        # 3. Expédition WhatsApp
-        resultat_envoi = await send_whatsapp_message(numero_client, message_text)
-        payload_interne["delivery_status"] = resultat_envoi
-        
-        # 4. Synchronisation CRM
-        if resultat_envoi.get("status") in ["success", "mocked"]:
-            crm_result = await update_crm_after_message(
-                lead_id=lead_id,
-                step_sent=current_step,
-                classification=classification
-            )
-            payload_interne["crm_update_status"] = crm_result
-        else:
-            print("⚠️ [CLOSER] Échec de l'envoi WhatsApp. Mise à jour du CRM annulée.")
-            payload_interne["crm_update_status"] = {"status": "skipped", "reason": "WhatsApp failure"}
-        
-        return payload_interne
-
     async def analyze_and_reply(self, lead_data: Dict[str, Any], message_text: str) -> Dict[str, Any]:
         """
-        Logique Entrante : Analyse les réponses des clients avec Gemma.
+        Logique Entrante : Analyse les réponses des clients de manière approfondie avec Langfuse SDK.
         """
         name = lead_data.get("first_name", "Client")
         industry = lead_data.get("industry_segment", "Secteur Inconnu")
         numero_client = lead_data.get("phone", "+212600000000")
+        lead_id = lead_data.get("lead_id", "unknown")
 
-        print(f"\n🤖 [NLP] Analyse cognitive de la réponse de {name} via Gemma...")
+        print(f"\n🤖 [NLP] Analyse cognitive approfondie de la réponse de {name} via Langfuse SDK...")
 
         try:
-            chain = self.objection_prompt | self.llm
+            disponibilites_cal = await get_available_slots(3)
+
+            prompt_template = langfuse_client.get_prompt("closer_objection_handler")
             
-           # 👇 MODIFICATION DE L'APPEL AINVOKE 👇
-            raw_response = await chain.ainvoke(
-                {
-                    "name": name,
-                    "industry": industry,
-                    "message": message_text
-                },
-                config={
-                    "callbacks": [self.langfuse_handler],
-                    "metadata": {
-                        "langfuse_session_id": lead_data.get("lead_id"),
-                        "langfuse_user_id": lead_data.get("lead_id"),
-                        # 🎯 Les tags pour le traitement des réponses :
-                        "langfuse_tags": [
-                            lead_data.get("lead_id", "unknown"), 
-                            "dynamic_objection_handler", 
-                            "whatsapp", 
-                            "inbound_reply"
-                        ]
-                    }
-                }
+            # 2. On injecte la variable 'disponibilites' dans la compilation du prompt
+            system_instruction = prompt_template.compile(
+                name=name,
+                industry=industry,
+                message=message_text,
+                disponibilites=disponibilites_cal
             )
-            # 👆 FIN DE LA MODIFICATION 👆
 
-            content = raw_response.content
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            
-            if json_match:
-                llm_data = json.loads(json_match.group(0))
-            else:
-                llm_data = {
-                    "intention": "INCONNUE", 
-                    "reponse_generee": f"Merci pour votre retour {name}. Je prends note de votre message et je reviens vers vous rapidement."
-                }
+            user_message = f"Analyse ce message de mon prospect et réponds en respectant les consignes : '{message_text}'"
+            with propagate_attributes(
+                user_id=lead_id,
+                session_id=lead_id,
+                tags=[lead_id, "dynamic_objection_handler", "whatsapp", "inbound_reply", self.model_workhorse]
+            ):
+                with langfuse_client.start_as_current_observation(
+                    as_type="generation",
+                    name="closer-objection-analysis",
+                    model=self.model_workhorse,
+                    input=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_message}
+                    ],
+                    prompt=prompt_template,
+                ) as generation:
+                    
+                    evaluation, raw_response = await self.client.messages.create_with_completion(
+                        model=self.model_workhorse,
+                        messages=[
+                            {"role": "system", "content": system_instruction},
+                            {"role": "user", "content": user_message}
+                        ],
+                        response_model=ObjectionAnalysis,
+                        temperature=0.3,
+                        max_tokens=250,
+                    )
 
-            intention = llm_data.get("intention", "INCONNUE")
-            texte_a_envoyer = llm_data.get("reponse_generee")
+                    usage_data = getattr(raw_response, 'usage', None)
+                    input_tokens, output_tokens, total_tokens = 0, 0, 0
+
+                    if usage_data:
+                        if isinstance(usage_data, dict):
+                            input_tokens = usage_data.get("prompt_tokens", 0)
+                            output_tokens = usage_data.get("completion_tokens", 0)
+                            total_tokens = usage_data.get("total_tokens", 0)
+                        else:
+                            input_tokens = getattr(usage_data, "prompt_tokens", 0)
+                            output_tokens = getattr(usage_data, "completion_tokens", 0)
+                            total_tokens = getattr(usage_data, "total_tokens", 0)
+
+                    update_payload = {"output": evaluation.model_dump()}
+                    if total_tokens > 0:
+                        update_payload["usage_details"] = {
+                            "input": input_tokens,
+                            "output": output_tokens,
+                            "total": total_tokens
+                        }
+
+                    generation.update(**update_payload)
+
+            intention = evaluation.intention
+            texte_a_envoyer = evaluation.reponse_generee
 
             print(f"🎯 [NLP] Intention qualifiée : {intention}")
             print(f"💬 [NLP] Contre-argument généré : '{texte_a_envoyer}'")
 
             envoi_result = await send_whatsapp_message(numero_client, texte_a_envoyer)
-            lead_id = lead_data.get("lead_id")
-            if lead_id:
-                print(f"💾 [CLOSER] Notification du CRM Keeper pour la mise à jour des propriétés...")
-                
-                # On appelle l'outil CRM pour déclencher la route POST /crm/update
+            
+            if lead_id != "unknown":
+                print(f"💾 [CLOSER] Notification du CRM Keeper...")
                 await update_crm_after_message(
                     lead_id=lead_id,
-                    step_sent=99, # 99 indique que c'est une réponse de l'IA (hors séquence)
-                    classification=f"reponse_ia"
+                    step_sent=99,
+                    classification="reponse_ia"
                 )
-            else:
-                print("⚠️ [CLOSER] Pas de lead_id trouvé, mise à jour CRM ignorée.")
-            # 👆-------------------------------------------👆
 
             return {
                 "intention": intention,
@@ -221,5 +335,5 @@ class CloserAgent:
             }
 
         except Exception as e:
-            print(f"❌ [NLP] Erreur critique lors de l'appel à l'API Gemma : {e}")
+            print(f"❌ [NLP] Erreur critique lors de l'appel LLM approfondi : {e}")
             return {"intention": "ERREUR", "reponse_envoyee": None, "error": str(e)}

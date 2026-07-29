@@ -1,110 +1,75 @@
-import requests
-import os
+import httpx
 from datetime import datetime, timezone
-from dotenv import load_dotenv  
+from tenacity import retry, stop_after_attempt, wait_exponential
 
+from config import settings
+from dotenv import load_dotenv
 load_dotenv()
 
-# ==========================================
-# TEMPLATES DE SÉQUENCES (Acquisition B2B / Lead Gen)
-# ==========================================
+from langfuse import Langfuse
+from langfuse import observe, propagate_attributes
 
-# Séquence Nurture MQL (5 messages). Contenu éducatif axé sur les problèmes du prospect.
-MQL_SEQUENCE = {
-    0: {
-        "subject": "Repensez votre stratégie d'acquisition", 
-        "body": "Bonjour {nom},\n\nDans votre secteur, le défi majeur est d'attirer des leads qualifiés sans exploser le budget d'acquisition. Voici comment une approche automatisée redéfinit les standards..."
-    },
-    -1: {
-        "subject": "Comment les leaders de votre industrie génèrent des leads", 
-        "body": "Bonjour {nom},\n\nSaviez-vous que les entreprises les plus performantes automatisent leur qualification ? Un agent intelligent filtre les prospects instantanément pour ne garder que les opportunités réelles."
-    },
-    -2: {
-        "subject": "Cas d'usage : 3x plus de rendez-vous qualifiés", 
-        "body": "Bonjour {nom},\n\nEn déployant notre système, des entreprises similaires ont divisé par deux leur coût d'acquisition. Souhaitez-vous voir comment cette architecture fonctionne concrètement ?"
-    },
-    -3: {
-        "subject": "Le vrai coût des leads non traités", 
-        "body": "Bonjour {nom},\n\nOn sous-estime souvent l'impact des leads qui refroidissent par manque de suivi. Notre système prend le relais 24/7. Ça vous dirait d'en voir un aperçu ?"
-    },
-    -4: {
-        "subject": "Prêt à accélérer votre croissance, {nom} ?", 
-        "body": "Bonjour {nom},\n\nSi vous êtes prêt à implémenter une véritable machine d'acquisition, c'est le moment. Voici mon calendrier pour en discuter 15 minutes : [Lien Cal.com]"
-    }
-}
+# Initialisation du client Langfuse pour les tâches en arrière-plan
+langfuse_client = Langfuse()
 
-# Séquence Follow-up SQL (3 messages). Plus courts et directs.
-SQL_SEQUENCE = {
-    0: {
-        "subject": "Suite à notre échange sur vos objectifs", 
-        "body": "Bonjour {nom},\n\nVous m'aviez mentionné que la qualité de vos leads actuels freinait vos objectifs de vente. Je suis disponible pour un échange rapide de 10 min pour vous montrer notre solution."
-    },
-    -1: {
-        "subject": "{nom}, une idée rapide pour votre pipeline", 
-        "body": "Bonjour {nom},\n\nJuste un petit mot pour faire remonter mon précédent email. Notre système peut vraiment faire la différence pour vos commerciaux. Un petit appel jeudi vous conviendrait-il ?"
-    },
-    -2: {
-        "subject": "Je ferme le dossier ?", 
-        "body": "Bonjour {nom},\n\nN'ayant pas de nouvelles, j'en déduis que l'optimisation de vos conversions n'est plus une priorité. Faut-il que je mette notre échange en pause pour ne plus encombrer votre boîte mail ?"
-    }
-}
 
 # ==========================================
-# COMMUNICATION AVEC LE CRM KEEPER (Localhost)
+# COMMUNICATION AVEC LE CRM KEEPER & BREVO
 # ==========================================
-
-CRM_KEEPER_URL = "http://127.0.0.1:8000"
-
+@observe(name="[Closer ] Fetch Leads from CRM Keeper")
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
 def fetch_leads_from_crm_keeper():
     """Demande au CRM Keeper de fournir les leads via la route GET /stage/{stage_name}"""
     leads_trouves = []
-    
-    # On utilise ta route existante pour 'mql' puis pour 'sql'
     etapes_a_chercher = ["mql", "sql"]
+    with propagate_attributes(
+        tags=["cron", "sequence_runner", "fetch_leads", "closer"],  
+    ):
     
-    for etape in etapes_a_chercher:
-        url = f"{CRM_KEEPER_URL}/crm/leads/stage/{etape}"
         try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                # On ajoute les leads trouvés à notre grande liste
-                leads_trouves.extend(response.json())
-            else:
-                print(f"⚠️ Erreur du CRM Keeper lors de la recherche de l'étape '{etape}' : {response.text}")
-        except requests.exceptions.ConnectionError:
-            print("❌ Impossible de contacter le CRM Keeper. Est-il bien lancé sur le port 8000 ?")
-            return [] # On arrête tout si le serveur est éteint
-            
-    return leads_trouves
+            with httpx.Client(timeout=10.0) as client:
+                for etape in etapes_a_chercher:
+                    url = f"{settings.urls.crm_keeper}/crm/leads/stage/{etape}"
+                    response = client.get(url)
+                    response.raise_for_status()
+                    leads_trouves.extend(response.json())
+            return leads_trouves
+        except Exception as e:
+            print(f"❌ Impossible de contacter le CRM Keeper après 3 tentatives : {e}")
+            return []
 
+@observe(name="[Closer ] Update Lead via CRM Keeper")
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
 def update_lead_via_crm_keeper(lead_id: str, new_messages_sent: int, action_text: str):
     """Envoie la demande de mise à jour au CRM Keeper avec un entier (Number)."""
-    url = f"{CRM_KEEPER_URL}/crm/update"
+
+    with propagate_attributes(
+        tags=["cron", "sequence_runner", "update_lead", "closer"],
+    ):
+     url = f"{settings.urls.crm_keeper}/crm/update"
     
     crm_payload = {
         "lead_id": lead_id,
         "updates": {
-            "messages_sent": new_messages_sent,  # Format Int/Number exigé par HubSpot
+            "messages_sent": new_messages_sent,
             "last_action": action_text,
-            "last_action_at":datetime.now(timezone.utc).isoformat()
+            "last_action_at": datetime.now(timezone.utc).isoformat()
         }
     }
     
-    response = requests.post(url, json=crm_payload)
-    if response.status_code == 200:
+    with httpx.Client(timeout=10.0) as client:
+        response = client.post(url, json=crm_payload)
+        response.raise_for_status()
         print(f"✅ CRM Keeper a mis à jour le lead {lead_id} | action: {action_text}")
-    else:
-        print(f"❌ Rejet par le CRM Keeper pour le lead {lead_id} : {response.text}")
 
-
-
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
 def send_sequence_email(email: str, subject: str, body: str):
     """Envoie un e-mail professionnel via l'API REST de Brevo."""
-    api_key = os.getenv("BREVO_API_KEY")
-    sender_email = os.getenv("SENDER_EMAIL", "hamzabouazza55@gmail.com")
+    api_key = settings.api_keys.brevo
+    sender_email = settings.email.sender
     
     if not api_key:
-        print("⚠️ Clé API Brevo introuvable. Simulation de l'envoi.")
+        print("⚠️ Clé API Brevo introuvable dans settings.toml. Simulation de l'envoi.")
         print(f"📧 [SIMULATION] Envoi à {email} | Objet: {subject}")
         return True
 
@@ -123,122 +88,141 @@ def send_sequence_email(email: str, subject: str, body: str):
         "textContent": body
     }
     
+    with httpx.Client(timeout=10.0) as client:
+        response = client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        print(f"✅ VRAI EMAIL EXPÉDIÉ VIA BREVO À : {email} | Objet : {subject}")
+        return True
+
+# ==========================================
+# UTILITAIRE LANGFUSE POUR LES EMAILS
+# ==========================================
+
+def fetch_email_template_from_langfuse(template_name: str, nom_prospect: str) -> dict:
+    """Récupère le corps et l'objet de l'e-mail depuis Langfuse."""
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        prompt_obj = langfuse_client.get_prompt(template_name)
+        # Compilation du corps du texte (avec la variable {{nom}})
+        corps = prompt_obj.compile(nom=nom_prospect)
         
-        if response.status_code in [201, 202]:
-            print(f"✅ VRAI EMAIL EXPÉDIÉ VIA BREVO À : {email} | Objet : {subject}")
-            return True
-        else:
-            print(f"❌ Rejet par l'API Brevo : {response.text}")
-            return False
-            
+        # Récupération de l'objet (subject) stocké dans la configuration JSON de Langfuse
+        sujet = prompt_obj.config.get("subject", "Mise à jour concernant votre dossier")
+        
+        return {"subject": sujet, "body": corps}
     except Exception as e:
-        print(f"❌ Échec de la connexion à l'API Brevo : {e}")
-        return False
+        print(f"❌ [ERREUR LANGFUSE] Template {template_name} manquant ou non promu en production : {e}")
+        return None
 
 # ==========================================
 # MOTEUR PRINCIPAL D'EXÉCUTION
 # ==========================================
-
+@observe(name="[CRON] Email Sequence Runner", as_type="generation")
 def execute_pull_sequences():
     print("🚀 Début du balayage des séquences via le CRM Keeper...")
-    leads = fetch_leads_from_crm_keeper()
     
-    if not leads:
-        print("ℹ️ Aucun lead trouvé ou erreur de connexion.")
-        return
-        
-    for lead in leads:
-        lead_id = lead.get("lead_id")
-        nom = lead.get("first_name", "Client")
-        email = lead.get("email")
-        
-        # 1. Nettoyage du statut brut reçu par HubSpot
-        raw_status = str(lead.get("lead_stage")).upper().strip()
-        
-        # 2. Traduction intelligente du statut
-        if "MQL" in raw_status or "MARKETING" in raw_status:
-            status = "MQL"
-        elif "SQL" in raw_status or "SALES" in raw_status:
-            status = "SQL"
-        else:
-            status = raw_status
-        
-        # 3. Récupération sécurisée du compteur
-        msg_val = lead.get("messages_sent")
-        messages_sent = int(msg_val) if msg_val is not None and str(msg_val).strip() != "" else 0
-        
-        # 4. CALCUL DU DÉLAI DEPUIS LE DERNIER EMAIL
-        last_action_at_str = lead.get("last_action_at")
-        jours_ecoules = 999  # Par défaut, un grand nombre si c'est le 1er e-mail
-        
-        if last_action_at_str and messages_sent < 0:
-            try:
-                # On enlève la répétition datetime.datetime
-                last_date = datetime.fromisoformat(last_action_at_str.replace('Z', '+00:00'))
-                maintenant = datetime.now(timezone.utc)
-                jours_ecoules = (maintenant - last_date).days
-            except ValueError:
-                print(f"⚠️ Impossible de lire la date pour {nom}. On autorise l'envoi.")
+    # Création d'un ID de session unique pour cette exécution CRON
+    cron_session_id = f"cron_run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
-        print(f"👉 Analyse: {nom} | Statut: {status} | Etape: {messages_sent} | Jours écoulés: {jours_ecoules}")
-
-       # --- LOGIQUE MQL (5 messages, 1 tous les 4 jours) ---
-        if status == "MQL":
-            # 1. LA SÉQUENCE CLASSIQUE (De 0 à -4)
-            if messages_sent > -5:
-                if messages_sent == 0 or jours_ecoules >= 4:
-                    template = MQL_SEQUENCE.get(messages_sent)
-                    if template:
-                        # Envoi de l'e-mail via Brevo
-                        send_sequence_email(email, template["subject"], template["body"].format(nom=nom))
-                        # Mise à jour dans le CRM Keeper
-                        nouveau_compteur = messages_sent - 1
-                        etape = abs(messages_sent) + 1
-                        update_lead_via_crm_keeper(lead_id, nouveau_compteur, f"Email MQL envoyé (Étape {etape}/5)")
-                else:
-                    jours_restants = 4 - jours_ecoules
-                    print(f"⏳ {nom} (MQL) est en pause Nurturing. Prochain email dans {jours_restants} jour(s).")
+    # 1. Propagation des attributs (Tags & Session)
+    with propagate_attributes(
+        session_id=cron_session_id,
+        tags=["cron", "email_automation", "brevo", "sequence_runner"]
+    ):
+        # 2. Observation Langfuse du script (Type: span)
+        with langfuse_client.start_as_current_observation(
+            as_type="span",
+            name="cron-email-sequence-runner",
+        ) as observation:
             
-            # 👇 2. LE NOUVEAU JOB DE RÉ-ENGAGEMENT (7 JOURS) 👇
-            elif messages_sent == -5:
-                if jours_ecoules >= 7:
-                    print(f"🚨 [RÉANIMATION] 7 jours de silence pour {nom} ! Envoi du message de la dernière chance.")
-                    
-                    sujet = "Toujours d'actualité, {nom} ?"
-                    corps = "Bonjour {nom},\n\nN'ayant pas eu de retour de votre part suite à mes précédents messages, je me permets une dernière relance douce.\n\nEst-ce que l'optimisation de vos processus est toujours un sujet d'actualité pour vous en ce moment ?\n\nAu plaisir d'échanger,"
-                    
-                    # Envoi du message ultime
-                    send_sequence_email(email, sujet, corps.format(nom=nom))
-                    
-                    # On passe le compteur à -6 pour garantir la règle "once" (une seule fois)
-                    update_lead_via_crm_keeper(lead_id, -6, "Email de ré-engagement 7 jours envoyé")
-                else:
-                    jours_restants = 7 - jours_ecoules
-                    print(f"⏳ {nom} (MQL) a fini sa séquence. Attente de {jours_restants} jour(s) pour la tentative de ré-engagement.")
+            leads = fetch_leads_from_crm_keeper()
             
-            # 3. LE CLASSEMENT DÉFINITIF (À -6 ou moins)
-            else:
-                print(f"💀 {nom} (MQL) a déjà reçu le ré-engagement et reste silencieux. Dossier définitivement clos.")
+            if not leads:
+                print("ℹ️ Aucun lead trouvé ou erreur de connexion.")
+                observation.update(output={"status": "no_leads_found"})
+                return
+                
+            leads_traites = 0
+            emails_envoyes = 0
 
-        # --- LOGIQUE SQL (3 messages, 1 tous les 2 jours) ---
-        elif status == "SQL":
-            if messages_sent > -3:
-                # Si c'est le 1er e-mail (0) OU que 2 jours minimum sont passés
-                if messages_sent == 0 or jours_ecoules >= 2:
-                    template = SQL_SEQUENCE.get(messages_sent)
-                    if template:
-                        # 1. Envoi de l'e-mail via Brevo
-                        send_sequence_email(email, template["subject"], template["body"].format(nom=nom))
-                        # 2. Mise à jour dans le CRM Keeper
-                        nouveau_compteur = messages_sent - 1
-                        etape = abs(messages_sent) + 1
-                        update_lead_via_crm_keeper(lead_id, nouveau_compteur, f"Email SQL envoyé (Étape {etape}/3)")
+            for lead in leads:
+                leads_traites += 1
+                lead_id = lead.get("lead_id")
+                nom = lead.get("first_name", "Client")
+                email = lead.get("email")
+                
+                raw_status = str(lead.get("lead_stage")).upper().strip()
+                
+                if "MQL" in raw_status or "MARKETING" in raw_status:
+                    status = "MQL"
+                elif "SQL" in raw_status or "SALES" in raw_status:
+                    status = "SQL"
                 else:
-                    jours_restants = 2 - jours_ecoules
-                    print(f"⏳ {nom} (SQL) est en pause Follow-up. Prochain email dans {jours_restants} jour(s).")
-            else:
-                print(f"⏩ {nom} (SQL) a terminé sa séquence de relance (Compteur final: {messages_sent}).")
+                    status = raw_status
+                
+                msg_val = lead.get("messages_sent")
+                messages_sent = int(msg_val) if msg_val is not None and str(msg_val).strip() != "" else 0
+                
+                last_action_at_str = lead.get("last_action_at")
+                jours_ecoules = 999  
+                
+                if last_action_at_str and messages_sent < 0:
+                    try:
+                        last_date = datetime.fromisoformat(last_action_at_str.replace('Z', '+00:00'))
+                        maintenant = datetime.now(timezone.utc)
+                        jours_ecoules = (maintenant - last_date).days
+                    except ValueError:
+                        print(f"⚠️ Impossible de lire la date pour {nom}.")
+
+                print(f"👉 Analyse: {nom} | Statut: {status} | Etape: {messages_sent} | Jours écoulés: {jours_ecoules}")
+
+                # --- LOGIQUE MQL ---
+                if status == "MQL":
+                    if messages_sent > -5:
+                        if messages_sent == 0 or jours_ecoules >= 5:
+                            etape = abs(messages_sent) + 1
+                            nom_template = f"email_mql_step_{etape}"
+                            
+                            template = fetch_email_template_from_langfuse(nom_template, nom)
+                            
+                            if template:
+                                send_sequence_email(email, template["subject"], template["body"])
+                                emails_envoyes += 1
+                                nouveau_compteur = messages_sent - 1
+                                update_lead_via_crm_keeper(lead_id, nouveau_compteur, f"Email MQL envoyé (Étape {etape}/5)")
+                    
+                    elif messages_sent == -5:
+                        if jours_ecoules >= 7:
+                            template = fetch_email_template_from_langfuse("email_mql_reengagement", nom)
+                            if template:
+                                send_sequence_email(email, template["subject"], template["body"])
+                                emails_envoyes += 1
+                                update_lead_via_crm_keeper(lead_id, -6, "Email de ré-engagement 7 jours envoyé")
+
+                # --- LOGIQUE SQL ---
+                elif status == "SQL":
+                    if messages_sent > -3:
+                        if messages_sent == 0 or jours_ecoules >= 2:
+                            etape = abs(messages_sent) + 1
+                            nom_template = f"email_sql_step_{etape}"
+                            
+                            template = fetch_email_template_from_langfuse(nom_template, nom)
+                            
+                            if template:
+                                send_sequence_email(email, template["subject"], template["body"])
+                                emails_envoyes += 1
+                                nouveau_compteur = messages_sent - 1
+                                update_lead_via_crm_keeper(lead_id, nouveau_compteur, f"Email SQL envoyé (Étape {etape}/3)")
+
+            # 3. Mise à jour de l'observation à la fin du traitement
+            observation.update(
+                output={
+                    "status": "success",
+                    "leads_scannes": leads_traites,
+                    "emails_expedies": emails_envoyes
+                }
+            )
+            
+    # 4. Assurer l'envoi des logs vers le serveur Langfuse
+    langfuse_client.flush()
 if __name__ == "__main__":
     execute_pull_sequences()

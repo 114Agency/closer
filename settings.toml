@@ -1,0 +1,34 @@
+# settings.toml
+[models]
+workhorse = "openrouter/deepseek/deepseek-v4-flash"
+quality = "openrouter/deepseek/deepseek-v4-pro"
+free_reasoning = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+free_structured = "openrouter/google/gemma-4-26b-a4b:free"
+
+# NOUVELLES SECTIONS POUR LE RUNNER
+[urls]
+crm_keeper = "http://127.0.0.1:8001"
+whatsapp_base = "https://waba-sandbox.360dialog.io/v1/messages"
+d360_webhook_setup = "https://waba-sandbox.360dialog.io/v1/configs/webhook"
+
+[api_keys]
+
+brevo = "@format {env[BREVO_API_KEY]}"
+cal_com = "@format {env[CAL_COM]}"
+d360 = "@format {env[D360_API_KEY]}"
+
+[email]
+sender = "hamzabouazza55@gmail.com"
+
+[cal_com]
+event_type_id = "5794629"
+api_url_slots = "https://api.cal.com/v2/slots/available"
+
+[webhook]
+# Laisse l'URL Ngrok active pour tes tests sur la machine locale (Port 8002)
+# closer_url = "https://outfield-pronounce-handheld.ngrok-free.dev/whatsapp/incoming"
+
+# Décommente celle-ci quand tu seras sur le VPS (Port 8002)
+ closer_url = "http://vpshosted.ddnsfree.com:8006/whatsapp/incoming"
+# closer_url = "https://outfield-pronounce-handheld.ngrok-free.dev//whatsapp/incoming"
+
